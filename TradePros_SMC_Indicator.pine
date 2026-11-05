@@ -1,0 +1,175 @@
+//@version=5
+indicator("TradePros SMC & Trend Trading System [Gold / XAUUSD]", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// ==========================================
+// 1. INPUT SETTINGS
+// ==========================================
+grp_trend   = "Trend & Dynamic Ribbon Settings"
+ribbon_type = input.string("EMA", "Ribbon Type", options=["EMA", "SMA", "RMA"], group=grp_trend)
+fast_len    = input.int(10, "Fast Baseline Length", minval=1, group=grp_trend)
+slow_len    = input.int(30, "Slow Baseline Length", minval=1, group=grp_trend)
+trend_len   = input.int(200, "Major Trend Filter Length (EMA 200)", minval=1, group=grp_trend)
+use_trend   = input.bool(true, "Filter Signals by Major Trend", group=grp_trend)
+
+grp_atr     = "Volatility & Risk Management (ATR)"
+atr_len     = input.int(14, "ATR Length", minval=1, group=grp_atr)
+atr_mult_sl = input.float(1.5, "Stop Loss ATR Multiplier", minval=0.5, step=0.1, group=grp_atr)
+tp1_mult_r  = input.float(1.0, "Take Profit 1 (R:R)", minval=0.5, step=0.25, group=grp_atr)
+tp2_mult_r  = input.float(2.0, "Take Profit 2 (R:R)", minval=1.0, step=0.5, group=grp_atr)
+tp3_mult_r  = input.float(3.0, "Take Profit 3 (R:R)", minval=1.5, step=0.5, group=grp_atr)
+
+grp_smc     = "Smart Money Concepts (SMC) & FVG"
+show_fvg    = input.bool(true, "Show Fair Value Gaps (FVG)", group=grp_smc)
+fvg_threshold = input.float(0.1, "FVG Min Size (Points/ATR Ratio)", minval=0.0, step=0.05, group=grp_smc)
+bull_fvg_col = input.color(color.new(color.teal, 80), "Bullish FVG Color", group=grp_smc)
+bear_fvg_col = input.color(color.new(color.orange, 80), "Bearish FVG Color", group=grp_smc)
+
+show_bos_choch = input.bool(true, "Show Market Structure (BOS / CHOCH)", group=grp_smc)
+pivot_len      = input.int(5, "Market Structure Pivot Length", minval=2, maxval=20, group=grp_smc)
+
+grp_visual  = "Visuals & Trade Projections"
+show_ribbon = input.bool(true, "Show Trend Ribbon", group=grp_visual)
+show_tp_sl  = input.bool(true, "Show TP/SL Level Projections", group=grp_visual)
+show_target_boxes = input.bool(true, "Show Risk/Reward Target Shading", group=grp_visual)
+
+// ==========================================
+// 2. TREND RIBBON & BASELINE CALCULATIONS
+// ==========================================
+f_ma(src, len, mtype) =>
+    mtype == "EMA" ? ta.ema(src, len) :
+     mtype == "SMA" ? ta.sma(src, len) :
+     ta.rma(src, len)
+
+fast_ma = f_ma(close, fast_len, ribbon_type)
+slow_ma = f_ma(close, slow_len, ribbon_type)
+trend_ma = ta.ema(close, trend_len)
+
+is_bullish_trend = fast_ma > slow_ma and (not use_trend or close > trend_ma)
+is_bearish_trend = fast_ma < slow_ma and (not use_trend or close < trend_ma)
+
+p1 = plot(show_ribbon ? fast_ma : na, "Fast Ribbon", color=color.new(color.green, 20), linewidth=1)
+p2 = plot(show_ribbon ? slow_ma : na, "Slow Ribbon", color=color.new(color.red, 20), linewidth=1)
+fill(p1, p2, color = fast_ma > slow_ma ? color.new(color.green, 75) : color.new(color.red, 75), title="Ribbon Cloud")
+plot(show_ribbon and use_trend ? trend_ma : na, "Major 200 EMA", color=color.new(color.blue, 30), linewidth=2)
+
+// ==========================================
+// 3. SMART MONEY CONCEPTS (FVG & STRUCTURE)
+// ==========================================
+atr_val = ta.atr(atr_len)
+
+// Fair Value Gaps (Bullish: low[0] > high[2], Bearish: high[0] < low[2])
+bull_fvg = show_fvg and (low > high[2]) and ((low - high[2]) >= atr_val * fvg_threshold)
+bear_fvg = show_fvg and (high < low[2]) and ((low[2] - high) >= atr_val * fvg_threshold)
+
+if bull_fvg
+    box.new(left=bar_index - 2, top=low, right=bar_index + 10, bottom=high[2],
+            bgcolor=bull_fvg_col, border_color=color.teal, border_style=line.style_dotted)
+
+if bear_fvg
+    box.new(left=bar_index - 2, top=low[2], right=bar_index + 10, bottom=high,
+            bgcolor=bear_fvg_col, border_color=color.orange, border_style=line.style_dotted)
+
+// Market Structure (Pivots, BOS & CHOCH)
+ph = ta.pivothigh(high, pivot_len, pivot_len)
+pl = ta.pivotlow(low, pivot_len, pivot_len)
+
+var float last_ph = na
+var float last_pl = na
+var int market_bias = 0 // 1: Bullish, -1: Bearish
+
+if not na(ph)
+    last_ph := ph
+if not na(pl)
+    last_pl := pl
+
+bull_bos = show_bos_choch and ta.crossover(close, last_ph)
+bear_bos = show_bos_choch and ta.crossunder(close, last_pl)
+
+if bull_bos
+    line.new(bar_index - pivot_len, last_ph, bar_index, last_ph, color=color.teal, width=1, style=line.style_dashed)
+    label.new(bar_index, last_ph, market_bias == -1 ? "CHOCH" : "BOS", color=color.teal, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    market_bias := 1
+
+if bear_bos
+    line.new(bar_index - pivot_len, last_pl, bar_index, last_pl, color=color.maroon, width=1, style=line.style_dashed)
+    label.new(bar_index, last_pl, market_bias == 1 ? "CHOCH" : "BOS", color=color.maroon, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    market_bias := -1
+
+// ==========================================
+// 4. SIGNAL GENERATION ENGINE
+// ==========================================
+// Entry confluence: Ribbon crossover or alignment + pullback candle closing in direction
+bull_cross = ta.crossover(fast_ma, slow_ma)
+bear_cross = ta.crossunder(fast_ma, slow_ma)
+
+// Pullback trigger inside trend
+bull_pullback = is_bullish_trend and low[1] <= fast_ma and close > fast_ma and close > open
+bear_pullback = is_bearish_trend and high[1] >= fast_ma and close < fast_ma and close < open
+
+var int last_signal_dir = 0 // 1 = Buy, -1 = Sell
+buy_condition  = (bull_cross or bull_pullback) and (not use_trend or close > trend_ma) and (last_signal_dir != 1)
+sell_condition = (bear_cross or bear_pullback) and (not use_trend or close < trend_ma) and (last_signal_dir != -1)
+
+var float entry_price = na
+var float sl_price = na
+var float tp1_price = na
+var float tp2_price = na
+var float tp3_price = na
+
+if buy_condition
+    last_signal_dir := 1
+    entry_price := close
+    sl_dist = atr_val * atr_mult_sl
+    sl_price := entry_price - sl_dist
+    tp1_price := entry_price + (sl_dist * tp1_mult_r)
+    tp2_price := entry_price + (sl_dist * tp2_mult_r)
+    tp3_price := entry_price + (sl_dist * tp3_mult_r)
+
+    // Visual Buy Marker
+    label.new(bar_index, low - (atr_val * 0.4), "BUY\n" + str.tostring(close, "#.##"),
+              color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    if show_tp_sl
+        label.new(bar_index + 4, sl_price, "SL: " + str.tostring(sl_price, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index + 4, tp1_price, "TP1: " + str.tostring(tp1_price, "#.##"), color=color.green, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index + 4, tp2_price, "TP2: " + str.tostring(tp2_price, "#.##"), color=color.green, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index + 4, tp3_price, "TP3: " + str.tostring(tp3_price, "#.##"), color=color.green, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+    if show_target_boxes
+        box.new(left=bar_index, top=tp2_price, right=bar_index + 12, bottom=entry_price, bgcolor=color.new(color.green, 85), border_color=color.green)
+        box.new(left=bar_index, top=entry_price, right=bar_index + 12, bottom=sl_price, bgcolor=color.new(color.red, 85), border_color=color.red)
+
+if sell_condition
+    last_signal_dir := -1
+    entry_price := close
+    sl_dist = atr_val * atr_mult_sl
+    sl_price := entry_price + sl_dist
+    tp1_price := entry_price - (sl_dist * tp1_mult_r)
+    tp2_price := entry_price - (sl_dist * tp2_mult_r)
+    tp3_price := entry_price - (sl_dist * tp3_mult_r)
+
+    // Visual Sell Marker
+    label.new(bar_index, high + (atr_val * 0.4), "SELL\n" + str.tostring(close, "#.##"),
+              color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    if show_tp_sl
+        label.new(bar_index + 4, sl_price, "SL: " + str.tostring(sl_price, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index + 4, tp1_price, "TP1: " + str.tostring(tp1_price, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index + 4, tp2_price, "TP2: " + str.tostring(tp2_price, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        label.new(bar_index + 4, tp3_price, "TP3: " + str.tostring(tp3_price, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+    if show_target_boxes
+        box.new(left=bar_index, top=entry_price, right=bar_index + 12, bottom=tp2_price, bgcolor=color.new(color.green, 85), border_color=color.green)
+        box.new(left=bar_index, top=sl_price, right=bar_index + 12, bottom=entry_price, bgcolor=color.new(color.red, 85), border_color=color.red)
+
+// ==========================================
+// 5. ALERT PLOTS & CONDITIONS
+// ==========================================
+// Hidden plot for SL value so {{plot("SL Level")}} can be referenced in alert messages
+plot(sl_price, title="SL Level", display=display.none)
+plot(tp1_price, title="TP1 Level", display=display.none)
+plot(tp2_price, title="TP2 Level", display=display.none)
+plot(tp3_price, title="TP3 Level", display=display.none)
+
+alertcondition(buy_condition, title="TradePros BUY Signal", message="🟢 TradePros BUY Signal on {{ticker}} at {{close}} | SL: {{plot(\"SL Level\")}} | TP1: {{plot(\"TP1 Level\")}} | TP2: {{plot(\"TP2 Level\")}}")
+alertcondition(sell_condition, title="TradePros SELL Signal", message="🔴 TradePros SELL Signal on {{ticker}} at {{close}} | SL: {{plot(\"SL Level\")}} | TP1: {{plot(\"TP1 Level\")}} | TP2: {{plot(\"TP2 Level\")}}")
