@@ -1,80 +1,65 @@
-// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// © crosscriss482
-
-//@version=6
-strategy("UT Bot + Structure Fusion - Strategy", overlay = true, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.04)
+//@version=5
+strategy("TradePros SMC Trend Strategy [Gold/XAUUSD]", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.04)
 
 // ============================================================================
-// INPUTS
+// 1. INPUT CONFIGURATIONS
 // ============================================================================
-sensitivity    = input.float(2.0, "Signal Sensitivity")
-utAtrPeriod    = input.int(1, "UT Bot ATR Period", minval = 1)
-entryMode      = input.string("UT Bot Only", "Entry Mode", options = ["UT Bot Only", "UT Bot + Structure Confluence", "Structure Breakout (CHoCH)"])
-tradeDirection = input.string("Both", "Signal Direction", options = ["Both", "Buy Only", "Sell Only"])
-swingLookback  = input.int(5, "Swing Lookback", minval = 1)
-riskAtrLen     = input.int(14, "Risk ATR Length", minval = 1)
-slMode         = input.string("Structure", "Stop Loss Mode", options = ["ATR-Based", "Fixed Distance", "Structure"])
-tpMode         = input.string("Structure", "Take Profit Mode", options = ["ATR-Based", "Fixed Distance", "Structure"])
-atrMinMult     = input.float(0.5, "Min SL Distance (x ATR)")
-atrFallbackMult= input.float(1.5, "ATR Fallback Multiple")
-beMode         = input.string("TP1", "Move SL to Breakeven At", options = ["TP1", "TP2", "TP3", "Off"])
+grp_trend = "Trend Cloud & Ribbon Settings"
+fast_len = input.int(10, "Fast Ribbon EMA Length", minval=1, group=grp_trend)
+slow_len = input.int(30, "Slow Ribbon EMA Length", minval=1, group=grp_trend)
+use_trend_filter = input.bool(true, "Use 200 EMA Baseline Filter", group=grp_trend)
+base_len = input.int(200, "Baseline EMA Length", minval=1, group=grp_trend)
 
-// UT Bot Engine
-xATR  = ta.atr(utAtrPeriod)
-nLoss = sensitivity * xATR
-src   = close
+grp_risk = "Risk & Target Settings"
+atr_period = input.int(14, "ATR Period", minval=1, group=grp_risk)
+sl_mult = input.float(1.5, "Stop Loss ATR Multiple", minval=0.5, step=0.1, group=grp_risk)
+tp1_mult = input.float(1.5, "Take Profit 1 (TP1) R:R Multiple", minval=0.5, step=0.1, group=grp_risk)
+tp2_mult = input.float(3.0, "Take Profit 2 (TP2) R:R Multiple", minval=1.0, step=0.1, group=grp_risk)
 
-var float xATRTrailingStop = 0.0
-xATRTrailingStop := src > nz(xATRTrailingStop[1], 0) and src[1] > nz(xATRTrailingStop[1], 0) ? math.max(nz(xATRTrailingStop[1]), src - nLoss) :
-   src < nz(xATRTrailingStop[1], 0) and src[1] < nz(xATRTrailingStop[1], 0) ? math.min(nz(xATRTrailingStop[1]), src + nLoss) :
-   src > nz(xATRTrailingStop[1], 0) ? src - nLoss : src + nLoss
+// ============================================================================
+// 2. INDICATOR ENGINE CALCULATIONS
+// ============================================================================
+fast_ema = ta.ema(close, fast_len)
+slow_ema = ta.ema(close, slow_len)
+base_ema = ta.ema(close, base_len)
+atr_val = ta.atr(atr_period)
 
-above = ta.crossover(src, xATRTrailingStop)
-below = ta.crossover(xATRTrailingStop, src)
-buy   = src > xATRTrailingStop and above
-sell  = src < xATRTrailingStop and below
+buy_trigger = ta.crossover(fast_ema, slow_ema) and (not use_trend_filter or close > base_ema)
+sell_trigger = ta.crossunder(fast_ema, slow_ema) and (not use_trend_filter or close < base_ema)
 
-// Market Structure
-swingHigh = ta.pivothigh(high, swingLookback, swingLookback)
-swingLow  = ta.pivotlow(low, swingLookback, swingLookback)
-var array<float> swingHighs = array.new_float(0)
-var array<float> swingLows  = array.new_float(0)
-if not na(swingHigh)
-    array.push(swingHighs, swingHigh)
-if not na(swingLow)
-    array.push(swingLows, swingLow)
+var float long_sl = na
+var float long_tp1 = na
+var float long_tp2 = na
 
-lastSwingHigh = array.size(swingHighs) > 0 ? array.get(swingHighs, array.size(swingHighs) - 1) : na
-lastSwingLow  = array.size(swingLows) > 0 ? array.get(swingLows, array.size(swingLows) - 1) : na
+var float short_sl = na
+var float short_tp1 = na
+var float short_tp2 = na
 
-var int trend = 0
-bullishBreak = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
-bearishBreak = not na(lastSwingLow) and ta.crossunder(close, lastSwingLow)
-if bullishBreak
-    trend := 1
-if bearishBreak
-    trend := -1
+if buy_trigger
+    long_sl := close - (atr_val * sl_mult)
+    risk = close - long_sl
+    long_tp1 := close + (risk * tp1_mult)
+    long_tp2 := close + (risk * tp2_mult)
 
-bullishCHoCH = bullishBreak and trend != 1
-bearishCHoCH = bearishBreak and trend != -1
-
-// Entry conditions
-directionAllowsBuy  = tradeDirection == "Both" or tradeDirection == "Buy Only"
-directionAllowsSell = tradeDirection == "Both" or tradeDirection == "Sell Only"
-
-candBuy  = entryMode == "UT Bot Only" ? buy : entryMode == "UT Bot + Structure Confluence" ? (buy and trend == 1) : bullishCHoCH
-candSell = entryMode == "UT Bot Only" ? sell : entryMode == "UT Bot + Structure Confluence" ? (sell and trend == -1) : bearishCHoCH
-
-atrVal = ta.atr(riskAtrLen)
-
-if candBuy and directionAllowsBuy
-    slPrice = not na(lastSwingLow) and lastSwingLow < close ? lastSwingLow : close - atrVal * atrMinMult
-    tpPrice = not na(lastSwingHigh) and lastSwingHigh > close ? lastSwingHigh : close + atrVal * atrFallbackMult
     strategy.entry("Long", strategy.long)
-    strategy.exit("Exit Long", "Long", stop = slPrice, limit = tpPrice)
+    strategy.exit("Exit Long TP1", "Long", qty_percent=50, limit=long_tp1, stop=long_sl)
+    strategy.exit("Exit Long TP2", "Long", limit=long_tp2, stop=long_sl)
 
-if candSell and directionAllowsSell
-    slPrice = not na(lastSwingHigh) and lastSwingHigh > close ? lastSwingHigh : close + atrVal * atrMinMult
-    tpPrice = not na(lastSwingLow) and lastSwingLow < close ? lastSwingLow : close - atrVal * atrFallbackMult
+if sell_trigger
+    short_sl := close + (atr_val * sl_mult)
+    risk = short_sl - close
+    short_tp1 := close - (risk * tp1_mult)
+    short_tp2 := close - (risk * tp2_mult)
+
     strategy.entry("Short", strategy.short)
-    strategy.exit("Exit Short", "Short", stop = slPrice, limit = tpPrice)
+    strategy.exit("Exit Short TP1", "Short", qty_percent=50, limit=short_tp1, stop=short_sl)
+    strategy.exit("Exit Short TP2", "Short", limit=short_tp2, stop=short_sl)
+
+// Visuals
+p_fast = plot(fast_ema, "Fast Ribbon EMA", color=color.new(#26a69a, 20), linewidth=2)
+p_slow = plot(slow_ema, "Slow Ribbon EMA", color=color.new(#ef5350, 20), linewidth=2)
+ribbon_col = fast_ema >= slow_ema ? color.new(#089981, 80) : color.new(#f23645, 80)
+fill(p_fast, p_slow, color=ribbon_col, title="Ribbon Cloud")
+plot(use_trend_filter ? base_ema : na, "200 EMA Baseline", color=color.new(#fbc02d, 10), linewidth=2)

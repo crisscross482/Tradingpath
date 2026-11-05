@@ -1,754 +1,176 @@
-// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// © crosscriss482
-//
-// ============================================================================
-// UT BOT + STRUCTURE FUSION - PRO
-// ============================================================================
-// Merged and upgraded from two source scripts:
-//   1) "Bluecloud non-repainting" - UT Bot Alerts-based trailing stop signal
-//      engine with SL/TP, breakeven, dashboard.
-//   2) "Custom Structure Indicator v1" - swing/BOS/CHoCH structure engine
-//      with structure-derived SL/TP.
-//
-// WHAT CHANGED VS THE ORIGINALS (read this once, then ignore the comments):
-//   - Two ATRs, not one: a fast ATR still drives the UT Bot trailing-stop
-//     signal (as before), but a separate, standard-length ATR now drives
-//     all SL/TP sizing/floors/fallbacks. The original reused a period-1 ATR
-//     for both, which makes stop-sizing unnecessarily noisy.
-//   - Three Entry Modes, selectable, none forced on by default:
-//       "UT Bot Only"                    -> original UT Bot signals, untouched
-//       "UT Bot + Structure Confluence"  -> UT Bot signal, only when it
-//                                            agrees with structure trend
-//       "Structure Breakout (CHoCH)"     -> trade the structure break itself
-//     Default is "UT Bot Only" on purpose - you already found that a hard
-//     structure filter alone hurt performance, so confluence/breakout modes
-//     are here as options to test, not defaults.
-//   - Stop Loss / Take Profit now has a THIRD mode, "Structure", on top of
-//     the original ATR-Based and Fixed Distance modes. It uses validated
-//     swing levels (only counted if genuinely on the correct side of price)
-//     with an ATR floor (never an unrealistically tight stop) and ATR
-//     fallback (never an undefined target when structure data is thin).
-//   - New optional filters that were only "planned" in your project notes:
-//     HTF trend filter, volatility-regime (ATR percentile) filter, session
-//     time filter, signal cooldown (on by default), and a minimum R:R
-//     filter that can veto a trade before it's ever opened.
-//   - Dashboard keeps everything from before and adds an Avg R (expectancy)
-//     column, which tells you more about whether a setup is worth running
-//     than net R alone.
-//   - Trade entries are opened immediately at the signal bar (no separate
-//     pending/fill state machine) - since both entry sources here already
-//     resolve to essentially the current price at trigger time, that extra
-//     state added complexity without changing outcomes.
-// ============================================================================
-
-//@version=6
-indicator("UT Bot + Structure Fusion - Pro", overlay = true, max_labels_count = 500, max_lines_count = 500)
+//@version=5
+indicator("TradePros SMC Trend System [Gold/XAUUSD]", overlay=true, max_boxes_count=500, max_labels_count=500)
 
 // ============================================================================
-// GROUPS
+// 1. INPUT CONFIGURATIONS
 // ============================================================================
-G_SIGNAL  = "UT Bot Signal Engine"
-G_ENTRY   = "Entry Mode"
-G_STRUCT  = "Market Structure"
-G_FILTER  = "Filters"
-G_SLTP    = "Stop Loss / Take Profit"
-G_BE      = "Breakeven"
-G_DISPLAY = "Display"
-G_DASH    = "Dashboard"
+grp_trend = "Trend Cloud & Ribbon Settings"
+fast_len = input.int(10, "Fast Ribbon EMA Length", minval=1, group=grp_trend)
+slow_len = input.int(30, "Slow Ribbon EMA Length", minval=1, group=grp_trend)
+use_trend_filter = input.bool(true, "Use 200 EMA Baseline Filter", group=grp_trend)
+base_len = input.int(200, "Baseline EMA Length", minval=1, group=grp_trend)
 
-// ============================================================================
-// INPUTS - UT BOT SIGNAL ENGINE
-// ============================================================================
-sensitivity    = input.float(2.0, "Signal Sensitivity", group = G_SIGNAL)
-utAtrPeriod    = input.int(1, "UT Bot ATR Period (fast, drives signal only)", minval = 1, group = G_SIGNAL,
-   tooltip = "This short-period ATR controls how tight the trailing stop is for signal generation. It is intentionally fast/noisy by design. It is NOT used for stop-loss sizing anymore - see 'Risk ATR Length' below.")
-useHeikin      = input.bool(false, "Use Heikin Ashi Source", group = G_SIGNAL,
-   tooltip = "Heikin Ashi values are synthetic/smoothed and can very slightly recalculate as new bars form. Even with 'Wait for Bar Close' enabled, this can still cause minor repainting. Keep OFF for the most reliable non-repainting signals.")
-confirmOnClose = input.bool(true, "Wait for Bar Close Before Signal (Recommended)", group = G_SIGNAL,
-   tooltip = "When ON, signals (and everything downstream) are only generated once the current bar has fully closed. Turn OFF only if you want the earliest, unconfirmed intrabar signal (higher repaint risk).")
-colorBars      = input.bool(true, "Color Bars By Raw Trend", group = G_SIGNAL)
-showTrailStop  = input.bool(true, "Plot UT Trailing Stop Line", group = G_SIGNAL)
+grp_fvg = "Fair Value Gap (FVG) Settings"
+show_fvg = input.bool(true, "Display Fair Value Gaps", group=grp_fvg)
+fvg_threshold = input.float(0.0, "Minimum Gap Threshold (ATR Multiple)", step=0.1, group=grp_fvg)
+bull_fvg_col = input.color(color.new(#089981, 75), "Bullish FVG Box Color", group=grp_fvg)
+bear_fvg_col = input.color(color.new(#f23645, 75), "Bearish FVG Box Color", group=grp_fvg)
 
-// ============================================================================
-// INPUTS - ENTRY MODE
-// ============================================================================
-entryMode = input.string("UT Bot Only", "Entry Mode", options = ["UT Bot Only", "UT Bot + Structure Confluence", "Structure Breakout (CHoCH)"], group = G_ENTRY,
-   tooltip = "UT Bot Only = original signals, unfiltered by structure. Confluence = UT Bot signal must agree with the current structural trend. Structure Breakout = trade the CHoCH swing break itself, independent of UT Bot. Default is UT Bot Only based on your earlier finding that hard structure filtering alone hurt results - test the other modes deliberately.")
-tradeDirection = input.string("Both", "Signal Direction", options = ["Both", "Buy Only", "Sell Only"], group = G_ENTRY,
-   tooltip = "Restricts NEW trade entries to one direction. Opposite-direction signals can still close an open trade (see Opposite-Signal Exit).")
+grp_structure = "Market Structure (BOS / CHOCH)"
+show_structure = input.bool(true, "Show BOS / CHOCH Breakouts", group=grp_structure)
+swing_length = input.int(5, "Swing High / Low Lookback", minval=1, group=grp_structure)
+
+grp_risk = "Target & Risk-Reward Projections"
+show_tp_sl = input.bool(true, "Show Entry Target & SL Projections", group=grp_risk)
+atr_period = input.int(14, "ATR Period for SL/TP", minval=1, group=grp_risk)
+sl_mult = input.float(1.5, "Stop Loss ATR Multiple", minval=0.5, step=0.1, group=grp_risk)
+tp1_mult = input.float(1.5, "Take Profit 1 (TP1) R:R Multiple", minval=0.5, step=0.1, group=grp_risk)
+tp2_mult = input.float(3.0, "Take Profit 2 (TP2) R:R Multiple", minval=1.0, step=0.1, group=grp_risk)
+tp3_mult = input.float(4.5, "Take Profit 3 (TP3) R:R Multiple", minval=1.5, step=0.1, group=grp_risk)
 
 // ============================================================================
-// INPUTS - MARKET STRUCTURE
+// 2. INDICATOR ENGINE CALCULATIONS
 // ============================================================================
-swingLookback        = input.int(5, "Swing Lookback (bars each side)", minval = 1, group = G_STRUCT)
-maxHistory           = input.int(10, "Swing History Length", minval = 3, group = G_STRUCT)
-showStructureLabels  = input.bool(false, "Show BOS / CHoCH Labels", group = G_STRUCT)
-showSwingMarkers     = input.bool(false, "Show Swing High/Low Markers", group = G_STRUCT)
+fast_ema = ta.ema(close, fast_len)
+slow_ema = ta.ema(close, slow_len)
+base_ema = ta.ema(close, base_len)
+atr_val = ta.atr(atr_period)
 
-// ============================================================================
-// INPUTS - FILTERS
-// ============================================================================
-useHTFFilter  = input.bool(false, "Use HTF Trend Filter", group = G_FILTER)
-htfTF         = input.timeframe("60", "HTF Timeframe", group = G_FILTER)
-htfEmaLen     = input.int(50, "HTF EMA Length", group = G_FILTER)
+is_bullish_trend = fast_ema > slow_ema and (not use_trend_filter or close > base_ema)
+is_bearish_trend = fast_ema < slow_ema and (not use_trend_filter or close < base_ema)
 
-useVolFilter  = input.bool(false, "Use Volatility Regime Filter", group = G_FILTER,
-   tooltip = "Skips trades when current volatility (ATR) is in an extreme low or high percentile of its recent history - avoids dead chop and blow-out spikes.")
-volLookback   = input.int(100, "Volatility Percentile Lookback (bars)", minval = 20, group = G_FILTER)
-volMinPct     = input.float(20, "Min ATR Percentile", minval = 0, maxval = 100, group = G_FILTER)
-volMaxPct     = input.float(90, "Max ATR Percentile", minval = 0, maxval = 100, group = G_FILTER)
+// Dynamic Ribbon Cloud
+p_fast = plot(fast_ema, "Fast Ribbon EMA", color=color.new(#26a69a, 20), linewidth=2)
+p_slow = plot(slow_ema, "Slow Ribbon EMA", color=color.new(#ef5350, 20), linewidth=2)
+ribbon_col = fast_ema >= slow_ema ? color.new(#089981, 80) : color.new(#f23645, 80)
+fill(p_fast, p_slow, color=ribbon_col, title="Ribbon Cloud")
 
-useSession    = input.bool(false, "Use Session Time Filter", group = G_FILTER)
-sessionStr    = input.session("0800-1700", "Allowed Session (exchange time zone)", group = G_FILTER)
-
-useCooldown   = input.bool(true, "Use Signal Cooldown", group = G_FILTER,
-   tooltip = "Blocks a new signal from firing within N bars of the previous one - reduces signal clustering.")
-cooldownBars  = input.int(3, "Cooldown Bars Between Signals", minval = 0, group = G_FILTER)
-
-useRRFilter   = input.bool(false, "Require Minimum R:R To TP1", group = G_FILTER,
-   tooltip = "Computes the prospective risk:reward to TP1 before opening a trade. If it falls short, the trade is skipped entirely - no drawing, no dashboard count.")
-minRR         = input.float(1.0, "Minimum R:R (to TP1)", minval = 0.1, group = G_FILTER)
+plot(use_trend_filter ? base_ema : na, "200 EMA Baseline", color=color.new(#fbc02d, 10), linewidth=2)
 
 // ============================================================================
-// INPUTS - STOP LOSS / TAKE PROFIT
+// 3. FAIR VALUE GAPS (FVG)
 // ============================================================================
-slMode = input.string("Structure", "Stop Loss Mode", options = ["ATR-Based", "Fixed Distance", "Structure"], group = G_SLTP)
-tpMode = input.string("Structure", "Take Profit Mode", options = ["ATR-Based", "Fixed Distance", "Structure"], group = G_SLTP)
+var box[] fvg_boxes = array.new_box()
 
-riskAtrLen = input.int(14, "Risk ATR Length (sizing, separate from signal ATR)", minval = 1, group = G_SLTP)
+// Bullish FVG: Low of bar 0 > High of bar 2
+is_bull_fvg = show_fvg and (low > high[2]) and ((low - high[2]) >= atr_val * fvg_threshold)
+// Bearish FVG: High of bar 0 < Low of bar 2
+is_bear_fvg = show_fvg and (high < low[2]) and ((low[2] - high) >= atr_val * fvg_threshold)
 
-tp1Mult = input.float(1.0, "[ATR] TP1 (x Risk)", group = G_SLTP)
-tp2Mult = input.float(2.0, "[ATR] TP2 (x Risk)", group = G_SLTP)
-tp3Mult = input.float(3.0, "[ATR] TP3 (x Risk)", group = G_SLTP)
+if is_bull_fvg
+    b = box.new(left=bar_index[2], top=low, right=bar_index + 10, bottom=high[2],
+                 bgcolor=bull_fvg_col, border_color=color.new(bull_fvg_col, 40))
+    array.push(fvg_boxes, b)
 
-distanceUnit = input.string("Price Units", "[Fixed] Distance Unit", options = ["Price Units", "Pips"], group = G_SLTP)
-pointsPerPip = input.int(10, "[Pips] Points per Pip (10 = 5-digit FX broker, 1 = Gold/JPY pairs on most brokers - check yours)", minval = 1, group = G_SLTP)
+if is_bear_fvg
+    b = box.new(left=bar_index[2], top=low[2], right=bar_index + 10, bottom=high,
+                 bgcolor=bear_fvg_col, border_color=color.new(bear_fvg_col, 40))
+    array.push(fvg_boxes, b)
 
-fixedSLDistance  = input.float(10.0, "[Fixed] SL Distance",  minval = 0.00001, group = G_SLTP)
-fixedTP1Distance = input.float(10.0, "[Fixed] TP1 Distance", minval = 0.00001, group = G_SLTP)
-fixedTP2Distance = input.float(20.0, "[Fixed] TP2 Distance", minval = 0.00001, group = G_SLTP)
-fixedTP3Distance = input.float(30.0, "[Fixed] TP3 Distance", minval = 0.00001, group = G_SLTP)
-
-atrMinMult      = input.float(0.5, "[Structure] Min SL Distance (x Risk ATR floor)", minval = 0.1, group = G_SLTP,
-   tooltip = "If the nearest structure swing is too close to price to be a usable stop, this floor is used instead, so SL is never unrealistically tight.")
-atrFallbackMult = input.float(1.5, "[Structure] ATR Fallback Multiple (used when no valid further structure exists)", minval = 0.1, group = G_SLTP)
-
-// ============================================================================
-// INPUTS - BREAKEVEN
-// ============================================================================
-beMode   = input.string("TP1", "Move SL to Breakeven At", options = ["TP1", "TP2", "TP3", "Off"], group = G_BE)
-beOffset = input.float(0.0, "Breakeven Offset (extra locked profit, price units)", minval = 0.0, step = 0.00001, group = G_BE)
+// Clean up old boxes to avoid hitting resource limits
+if array.size(fvg_boxes) > 40
+    old_box = array.shift(fvg_boxes)
+    box.delete(old_box)
 
 // ============================================================================
-// INPUTS - DISPLAY
+// 4. MARKET STRUCTURE BREAKOUTS (BOS & CHOCH)
 // ============================================================================
-showSLTP    = input.bool(true, "Show SL / Entry / TP Levels", group = G_DISPLAY)
-labelOffset = input.int(5, "Label Offset (bars right of signal)", minval = 0, group = G_DISPLAY)
-lineLength  = input.int(15, "SL/Entry/TP Line Length (bars)", minval = 1, group = G_DISPLAY)
-showPositionHistory = input.bool(true, "Show Historical Long/Short Entry Markers", group = G_DISPLAY,
-   tooltip = "Plots a permanent marker at the exact entry price of every past opened trade - separate from the SL/TP lines above, which only show the currently active trade. Turn off to declutter the chart.")
+swing_high = ta.pivothigh(high, swing_length, swing_length)
+swing_low = ta.pivotlow(low, swing_length, swing_length)
 
-// ============================================================================
-// INPUTS - DASHBOARD
-// ============================================================================
-showDashboard = input.bool(true, "Show Dashboard", group = G_DASH)
-dashPosition  = input.string("Top Right", "Dashboard Position", group = G_DASH,
-   options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"])
-dashTextSize  = input.string("Small", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DASH)
+var float last_sh = na
+var float last_sl = na
+var int market_trend = 0 // 1: bullish, -1: bearish
 
-// ============================================================================
-// DERIVED CONSTANTS
-// ============================================================================
-pipSize = syminfo.mintick * pointsPerPip
+if not na(swing_high)
+    last_sh := swing_high
 
-toDistance(val) =>
-    distanceUnit == "Pips" ? val * pipSize : val
+if not na(swing_low)
+    last_sl := swing_low
 
-// ============================================================================
-// UT BOT CORE SIGNAL ENGINE (fast ATR - signal generation only)
-// ============================================================================
-xATR  = ta.atr(utAtrPeriod)
-nLoss = sensitivity * xATR
+bullish_bos = show_structure and not na(last_sh) and ta.crossover(close, last_sh) and market_trend == 1
+bullish_choch = show_structure and not na(last_sh) and ta.crossover(close, last_sh) and market_trend != 1
 
-src = useHeikin ? request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close, lookahead = barmerge.lookahead_off) : close
+bearish_bos = show_structure and not na(last_sl) and ta.crossunder(close, last_sl) and market_trend == -1
+bearish_choch = show_structure and not na(last_sl) and ta.crossunder(close, last_sl) and market_trend != -1
 
-var float xATRTrailingStop = 0.0
-xATRTrailingStop := src > nz(xATRTrailingStop[1], 0) and src[1] > nz(xATRTrailingStop[1], 0) ? math.max(nz(xATRTrailingStop[1]), src - nLoss) :
-   src < nz(xATRTrailingStop[1], 0) and src[1] < nz(xATRTrailingStop[1], 0) ? math.min(nz(xATRTrailingStop[1]), src + nLoss) :
-   src > nz(xATRTrailingStop[1], 0) ? src - nLoss : src + nLoss
+if bullish_bos or bullish_choch
+    market_trend := 1
+if bearish_bos or bearish_choch
+    market_trend := -1
 
-var int pos = 0
-pos := src[1] < nz(xATRTrailingStop[1], 0) and src > nz(xATRTrailingStop[1], 0) ? 1 :
-   src[1] > nz(xATRTrailingStop[1], 0) and src < nz(xATRTrailingStop[1], 0) ? -1 : nz(pos[1], 0)
+if bullish_bos
+    label.new(bar_index, high, "BOS", color=color.new(#089981, 0), textcolor=color.white,
+              style=label.style_label_down, size=size.tiny)
+if bullish_choch
+    label.new(bar_index, high, "CHOCH", color=color.new(#00897b, 0), textcolor=color.white,
+              style=label.style_label_down, size=size.tiny)
 
-xcolor = pos == -1 ? color.red : pos == 1 ? color.green : color.blue
-
-// NOTE: the original script wrapped src in ema(src, 1) before comparing to
-// the trailing stop. An EMA of length 1 is mathematically identical to its
-// source (no smoothing, no lag), so that step did nothing - removed here.
-above = ta.crossover(src, xATRTrailingStop)
-below = ta.crossover(xATRTrailingStop, src)
-
-// --- REPAINT FIX ---------------------------------------------------------
-// rawBuy/rawSell are the ORIGINAL, unconfirmed conditions and can flicker
-// intrabar. buy/sell are what everything downstream actually uses - when
-// confirmOnClose is ON they only ever become true once the bar is closed
-// and can never disappear afterwards.
-rawBuy  = src > xATRTrailingStop and above
-rawSell = src < xATRTrailingStop and below
-
-buy  = confirmOnClose ? (rawBuy  and barstate.isconfirmed) : rawBuy
-sell = confirmOnClose ? (rawSell and barstate.isconfirmed) : rawSell
-// --------------------------------------------------------------------------
-
-barbuy  = src > xATRTrailingStop
-barsell = src < xATRTrailingStop
-
-barcolor(colorBars and barbuy  ? color.green : na)
-barcolor(colorBars and barsell ? color.red   : na)
-
-plot(showTrailStop ? xATRTrailingStop : na, title = "UT Trailing Stop", color = xcolor, style = plot.style_line, linewidth = 1)
+if bearish_bos
+    label.new(bar_index, low, "BOS", color=color.new(#f23645, 0), textcolor=color.white,
+              style=label.style_label_up, size=size.tiny)
+if bearish_choch
+    label.new(bar_index, low, "CHOCH", color=color.new(#d32f2f, 0), textcolor=color.white,
+              style=label.style_label_up, size=size.tiny)
 
 // ============================================================================
-// MARKET STRUCTURE ENGINE (swing history, BOS / CHoCH, trend state)
+// 5. CONFLUENCE SIGNALS & TARGET PROJECTIONS
 // ============================================================================
-swingHigh = ta.pivothigh(high, swingLookback, swingLookback)
-swingLow  = ta.pivotlow(low, swingLookback, swingLookback)
+buy_trigger = ta.crossover(fast_ema, slow_ema) and (not use_trend_filter or close > base_ema)
+sell_trigger = ta.crossunder(fast_ema, slow_ema) and (not use_trend_filter or close < base_ema)
 
-var array<float> swingHighs = array.new_float(0)
-var array<float> swingLows  = array.new_float(0)
+var float entry_price = na
+var float sl_price = na
+var float tp1_price = na
+var float tp2_price = na
+var float tp3_price = na
 
-if not na(swingHigh)
-    array.push(swingHighs, swingHigh)
-    if array.size(swingHighs) > maxHistory
-        array.shift(swingHighs)
+if buy_trigger
+    entry_price := close
+    sl_price := close - (atr_val * sl_mult)
+    risk = entry_price - sl_price
+    tp1_price := entry_price + (risk * tp1_mult)
+    tp2_price := entry_price + (risk * tp2_mult)
+    tp3_price := entry_price + (risk * tp3_mult)
 
-if not na(swingLow)
-    array.push(swingLows, swingLow)
-    if array.size(swingLows) > maxHistory
-        array.shift(swingLows)
+    label.new(bar_index, low - (atr_val * 0.5), "BUY\n" + str.tostring(close, "#.##"),
+              color=#089981, textcolor=color.white, style=label.style_label_up, size=size.small)
 
-getSwingFromEnd(arr, n) =>
-    sz = array.size(arr)
-    sz > n ? array.get(arr, sz - 1 - n) : na
+    if show_tp_sl
+        box.new(left=bar_index, top=tp2_price, right=bar_index + 12, bottom=entry_price,
+                bgcolor=color.new(#089981, 85), border_color=color.new(#089981, 30))
+        box.new(left=bar_index, top=entry_price, right=bar_index + 12, bottom=sl_price,
+                bgcolor=color.new(#f23645, 85), border_color=color.new(#f23645, 30))
 
-lastSwingHigh  = getSwingFromEnd(swingHighs, 0)
-prevSwingHigh  = getSwingFromEnd(swingHighs, 1)
+if sell_trigger
+    entry_price := close
+    sl_price := close + (atr_val * sl_mult)
+    risk = sl_price - entry_price
+    tp1_price := entry_price - (risk * tp1_mult)
+    tp2_price := entry_price - (risk * tp2_mult)
+    tp3_price := entry_price - (risk * tp3_mult)
 
-lastSwingLow   = getSwingFromEnd(swingLows, 0)
-prevSwingLow   = getSwingFromEnd(swingLows, 1)
+    label.new(bar_index, high + (atr_val * 0.5), "SELL\n" + str.tostring(close, "#.##"),
+              color=#f23645, textcolor=color.white, style=label.style_label_down, size=size.small)
 
-plotshape(showSwingMarkers and not na(swingHigh), style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 40),   size = size.tiny, offset = -swingLookback, title = "Swing High")
-plotshape(showSwingMarkers and not na(swingLow),  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 40), size = size.tiny, offset = -swingLookback, title = "Swing Low")
+    if show_tp_sl
+        box.new(left=bar_index, top=entry_price, right=bar_index + 12, bottom=tp2_price,
+                bgcolor=color.new(#089981, 85), border_color=color.new(#089981, 30))
+        box.new(left=bar_index, top=sl_price, right=bar_index + 12, bottom=entry_price,
+                bgcolor=color.new(#f23645, 85), border_color=color.new(#f23645, 30))
 
-var int trend = 0   // 0 = undefined, 1 = bullish, -1 = bearish
-
-bullishBreak = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
-bearishBreak = not na(lastSwingLow)  and ta.crossunder(close, lastSwingLow)
-
-bullishBOS   = bullishBreak and trend == 1
-bullishCHoCH = bullishBreak and trend != 1
-bearishBOS   = bearishBreak and trend == -1
-bearishCHoCH = bearishBreak and trend != -1
-
-if bullishBreak
-    trend := 1
-if bearishBreak
-    trend := -1
-
-if showStructureLabels and bullishBOS
-    label.new(x = bar_index, y = low, text = "BOS", style = label.style_label_up, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
-if showStructureLabels and bullishCHoCH
-    label.new(x = bar_index, y = low, text = "CHoCH", style = label.style_label_up, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
-if showStructureLabels and bearishBOS
-    label.new(x = bar_index, y = high, text = "BOS", style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
-if showStructureLabels and bearishCHoCH
-    label.new(x = bar_index, y = high, text = "CHoCH", style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
+// Hidden plots for webhook alert interpolation {{plot("SL Level")}}, etc.
+plot(sl_price, "SL Level", display=display.none)
+plot(tp1_price, "TP1 Level", display=display.none)
+plot(tp2_price, "TP2 Level", display=display.none)
+plot(tp3_price, "TP3 Level", display=display.none)
+plot(entry_price, "Entry Level", display=display.none)
 
 // ============================================================================
-// RISK ATR (standard length, used for all SL/TP sizing)
+// 6. ALERTS FOR AUTOMATION & WEBHOOKS
 // ============================================================================
-atrVal = ta.atr(riskAtrLen)
-
-// ============================================================================
-// FILTERS
-// ============================================================================
-// HTF trend filter
-htfEmaVal  = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEmaLen), lookahead = barmerge.lookahead_off)
-htfBullish = close > htfEmaVal
-htfBearish = close < htfEmaVal
-
-// Volatility regime filter
-volPctRank = ta.percentrank(atrVal, volLookback)
-volOK = volPctRank >= volMinPct and volPctRank <= volMaxPct
-
-// Session filter
-inSession = not na(time(timeframe.period, sessionStr))
-
-// Cooldown
-var int lastSignalBar = na
-cooldownOK = not useCooldown or na(lastSignalBar) or (bar_index - lastSignalBar) >= cooldownBars
-
-// ============================================================================
-// ENTRY MODE -> CANDIDATE SIGNALS
-// ============================================================================
-directionAllowsBuy  = tradeDirection == "Both" or tradeDirection == "Buy Only"
-directionAllowsSell = tradeDirection == "Both" or tradeDirection == "Sell Only"
-
-rawCandBuy  = entryMode == "UT Bot Only" ? buy : entryMode == "UT Bot + Structure Confluence" ? (buy and trend == 1) : bullishCHoCH
-rawCandSell = entryMode == "UT Bot Only" ? sell : entryMode == "UT Bot + Structure Confluence" ? (sell and trend == -1) : bearishCHoCH
-
-// sigBuy/sigSell = fully filtered candidate, BEFORE the direction restriction -
-// used for opposite-signal exits even when direction is one-way.
-sigBuy  = rawCandBuy  and cooldownOK and (not useHTFFilter or htfBullish) and (not useVolFilter or volOK) and (not useSession or inSession)
-sigSell = rawCandSell and cooldownOK and (not useHTFFilter or htfBearish) and (not useVolFilter or volOK) and (not useSession or inSession)
-
-if sigBuy or sigSell
-    lastSignalBar := bar_index
-
-candBuy  = sigBuy  and directionAllowsBuy
-candSell = sigSell and directionAllowsSell
-
-// ============================================================================
-// STRUCTURE-BASED SL / TP (validated swing levels + ATR floor/fallback)
-// ============================================================================
-f_structSLTP(isLong, entryPrice) =>
-    rawSL  = isLong ? lastSwingLow  : lastSwingHigh
-    rawTP1 = isLong ? lastSwingHigh : lastSwingLow
-    rawTP2 = isLong ? prevSwingHigh : prevSwingLow
-
-    slValid  = not na(rawSL)  and (isLong ? rawSL  < entryPrice : rawSL  > entryPrice)
-    tp1Valid = not na(rawTP1) and (isLong ? rawTP1 > entryPrice : rawTP1 < entryPrice)
-    tp2Valid = not na(rawTP2) and (isLong ? rawTP2 > entryPrice : rawTP2 < entryPrice)
-
-    slDist  = slValid ? math.abs(entryPrice - rawSL) : na
-    slFinal = slValid and slDist >= atrVal * atrMinMult ? rawSL : (isLong ? entryPrice - atrVal * atrMinMult : entryPrice + atrVal * atrMinMult)
-
-    tp1Final = tp1Valid ? rawTP1 : (isLong ? entryPrice + atrVal * atrFallbackMult     : entryPrice - atrVal * atrFallbackMult)
-    tp2Final = tp2Valid ? rawTP2 : (isLong ? entryPrice + atrVal * atrFallbackMult * 2 : entryPrice - atrVal * atrFallbackMult * 2)
-    tp3Final = isLong ? entryPrice + atrVal * atrFallbackMult * 3 : entryPrice - atrVal * atrFallbackMult * 3
-
-    [slFinal, tp1Final, tp2Final, tp3Final]
-
-f_getSLTP(isLong, entryPrice) =>
-    [structSL, structTP1, structTP2, structTP3] = f_structSLTP(isLong, entryPrice)
-
-    atrSL     = isLong ? entryPrice - atrVal : entryPrice + atrVal
-    fixedSL   = isLong ? entryPrice - toDistance(fixedSLDistance) : entryPrice + toDistance(fixedSLDistance)
-
-    sl = slMode == "ATR-Based" ? atrSL : slMode == "Fixed Distance" ? fixedSL : structSL
-    risk = math.abs(entryPrice - sl)
-
-    atrTP1   = isLong ? entryPrice + risk * tp1Mult : entryPrice - risk * tp1Mult
-    atrTP2   = isLong ? entryPrice + risk * tp2Mult : entryPrice - risk * tp2Mult
-    atrTP3   = isLong ? entryPrice + risk * tp3Mult : entryPrice - risk * tp3Mult
-    fixedTP1 = isLong ? entryPrice + toDistance(fixedTP1Distance) : entryPrice - toDistance(fixedTP1Distance)
-    fixedTP2 = isLong ? entryPrice + toDistance(fixedTP2Distance) : entryPrice - toDistance(fixedTP2Distance)
-    fixedTP3 = isLong ? entryPrice + toDistance(fixedTP3Distance) : entryPrice - toDistance(fixedTP3Distance)
-
-    tp1 = tpMode == "ATR-Based" ? atrTP1 : tpMode == "Fixed Distance" ? fixedTP1 : structTP1
-    tp2 = tpMode == "ATR-Based" ? atrTP2 : tpMode == "Fixed Distance" ? fixedTP2 : structTP2
-    tp3 = tpMode == "ATR-Based" ? atrTP3 : tpMode == "Fixed Distance" ? fixedTP3 : structTP3
-
-    [sl, tp1, tp2, tp3]
-
-// ============================================================================
-// DASHBOARD STATE (periods + running counters)
-// ============================================================================
-dateKey = year * 10000 + month * 100 + dayofmonth
-var int lastDateKey = na
-isNewDay = na(lastDateKey) or dateKey != lastDateKey
-if isNewDay
-    lastDateKey := dateKey
-
-var int daySignals = 0
-var int weekSignals = 0
-var int monthSignals = 0
-var int allSignals = 0
-
-var int dayTrades = 0
-var int weekTrades = 0
-var int monthTrades = 0
-var int allTrades = 0
-
-var int dayWins = 0
-var int weekWins = 0
-var int monthWins = 0
-var int allWins = 0
-
-var int dayLosses = 0
-var int weekLosses = 0
-var int monthLosses = 0
-var int allLosses = 0
-
-var float dayR = 0.0
-var float weekR = 0.0
-var float monthR = 0.0
-var float allR = 0.0
-
-if isNewDay
-    daySignals := 0
-    dayTrades  := 0
-    dayWins    := 0
-    dayLosses  := 0
-    dayR       := 0.0
-
-if isNewDay and dayofweek == dayofweek.monday
-    weekSignals := 0
-    weekTrades  := 0
-    weekWins    := 0
-    weekLosses  := 0
-    weekR       := 0.0
-
-if isNewDay and dayofmonth == 1
-    monthSignals := 0
-    monthTrades  := 0
-    monthWins    := 0
-    monthLosses  := 0
-    monthR       := 0.0
-
-// ============================================================================
-// SL / ENTRY / TP DRAWING STATE
-// ============================================================================
-var line  slLine    = na
-var line  entryLine = na
-var line  tp1Line   = na
-var line  tp2Line   = na
-var line  tp3Line   = na
-var label slLabel    = na
-var label entryLabel = na
-var label tp1Label   = na
-var label tp2Label   = na
-var label tp3Label   = na
-var label sigLabel   = na
-var label beLabel    = na
-
-var bool  tradeActive  = false
-var bool  tradeIsLong  = false
-var bool  beTriggered  = false
-var float gEntryPrice  = na
-var float gSlPrice     = na
-var float gTp1Price    = na
-var float gTp2Price    = na
-var float gTp3Price    = na
-var float gRisk        = na
-
-deleteAll() =>
-    line.delete(slLine)
-    line.delete(entryLine)
-    line.delete(tp1Line)
-    line.delete(tp2Line)
-    line.delete(tp3Line)
-    label.delete(slLabel)
-    label.delete(entryLabel)
-    label.delete(tp1Label)
-    label.delete(tp2Label)
-    label.delete(tp3Label)
-    label.delete(sigLabel)
-    label.delete(beLabel)
-
-// ============================================================================
-// OPPOSITE-SIGNAL EXIT / STOP-AND-REVERSE
-// ============================================================================
-// Uses sigBuy/sigSell (filtered, but NOT direction-restricted) so an open
-// trade can always be closed by a genuine opposite signal. With Direction =
-// "Both" the entry block below opens the new trade on the same bar, giving
-// a stop-and-reverse. With a one-way Direction setting, this only flattens.
-closeLongOnOpposite  = tradeActive and tradeIsLong and sigSell
-closeShortOnOpposite = tradeActive and not tradeIsLong and sigBuy
-
-if closeLongOnOpposite or closeShortOnOpposite
-    rExit = tradeIsLong ? (src - gEntryPrice) / gRisk : (gEntryPrice - src) / gRisk
-
-    dayTrades   += 1
-    weekTrades  += 1
-    monthTrades += 1
-    allTrades   += 1
-    dayR        += rExit
-    weekR       += rExit
-    monthR      += rExit
-    allR        += rExit
-
-    if rExit > 0
-        dayWins   += 1
-        weekWins  += 1
-        monthWins += 1
-        allWins   += 1
-    else if rExit < 0
-        dayLosses   += 1
-        weekLosses  += 1
-        monthLosses += 1
-        allLosses   += 1
-
-    revText  = rExit > 0 ? "REV WIN" : rExit < 0 ? "REV LOSS" : "REV FLAT"
-    revColor = rExit > 0 ? color.green : rExit < 0 ? color.red : color.gray
-
-    if showSLTP
-        label.new(x = bar_index, y = tradeIsLong ? low : high, text = revText,
-           style = tradeIsLong ? label.style_label_up : label.style_label_down,
-           color = revColor, textcolor = color.white, size = size.tiny)
-
-    tradeActive := false
-
-alertcondition(closeLongOnOpposite or closeShortOnOpposite, "Opposite-Signal Exit", "Opposite signal - close open trade")
-
-// ============================================================================
-// TRADE ENTRY (candidate -> prospective SL/TP -> R:R gate -> open)
-// ============================================================================
-bool finalBuy  = false
-bool finalSell = false
-
-if candBuy or candSell
-    isLong = candBuy
-    entryPrice = entryMode == "Structure Breakout (CHoCH)" ? (isLong ? lastSwingHigh : lastSwingLow) : src
-
-    [slPrice, tp1Price, tp2Price, tp3Price] = f_getSLTP(isLong, entryPrice)
-    risk    = math.abs(entryPrice - slPrice)
-    reward1 = math.abs(tp1Price - entryPrice)
-    rr      = risk > 0 ? reward1 / risk : na
-    passRR  = not useRRFilter or (not na(rr) and rr >= minRR)
-
-    if passRR and risk > 0
-        finalBuy  := isLong
-        finalSell := not isLong
-
-        daySignals   += 1
-        weekSignals  += 1
-        monthSignals += 1
-        allSignals   += 1
-
-        tradeActive := true
-        tradeIsLong := isLong
-        beTriggered := false
-        gEntryPrice := entryPrice
-        gSlPrice    := slPrice
-        gTp1Price   := tp1Price
-        gTp2Price   := tp2Price
-        gTp3Price   := tp3Price
-        gRisk       := risk
-
-        if showSLTP
-            deleteAll()
-
-            labelX   = bar_index + labelOffset
-            lineEndX = bar_index + lineLength
-
-            sigLabel := label.new(x = bar_index, y = isLong ? low : high,
-               text = isLong ? "B" : "S",
-               style = label.style_square,
-               color = isLong ? color.green : color.red,
-               textcolor = color.white,
-               yloc = isLong ? yloc.belowbar : yloc.abovebar,
-               size = size.small)
-
-            slLine  := line.new(x1 = bar_index, y1 = slPrice, x2 = lineEndX, y2 = slPrice, extend = extend.none, color = color.red, width = 1)
-            slLabel := label.new(x = labelX, y = slPrice, text = "SL (" + str.tostring(slPrice, format.mintick) + ")",
-               style = label.style_label_left, color = color.red, textcolor = color.white, size = size.small)
-
-            entryLine  := line.new(x1 = bar_index, y1 = entryPrice, x2 = lineEndX, y2 = entryPrice, extend = extend.none, color = color.gray, width = 1)
-            entryLabel := label.new(x = labelX, y = entryPrice, text = "Entry (" + str.tostring(entryPrice, format.mintick) + ")",
-               style = label.style_label_left, color = color.gray, textcolor = color.white, size = size.small)
-
-            tp1Line  := line.new(x1 = bar_index, y1 = tp1Price, x2 = lineEndX, y2 = tp1Price, extend = extend.none, color = color.green, width = 1)
-            tp1Label := label.new(x = labelX, y = tp1Price, text = "TP1 (" + str.tostring(tp1Price, format.mintick) + ")",
-               style = label.style_label_left, color = color.green, textcolor = color.white, size = size.small)
-
-            tp2Line  := line.new(x1 = bar_index, y1 = tp2Price, x2 = lineEndX, y2 = tp2Price, extend = extend.none, color = color.green, width = 1)
-            tp2Label := label.new(x = labelX, y = tp2Price, text = "TP2 (" + str.tostring(tp2Price, format.mintick) + ")",
-               style = label.style_label_left, color = color.green, textcolor = color.white, size = size.small)
-
-            tp3Line  := line.new(x1 = bar_index, y1 = tp3Price, x2 = lineEndX, y2 = tp3Price, extend = extend.none, color = color.green, width = 1)
-            tp3Label := label.new(x = labelX, y = tp3Price, text = "TP3 (" + str.tostring(tp3Price, format.mintick) + ")",
-               style = label.style_label_left, color = color.green, textcolor = color.white, size = size.small)
-
-plotshape(finalBuy,  title = "Buy",  text = 'Buy',  style = shape.labelup,   location = location.belowbar, color = color.green, textcolor = color.white, size = size.tiny)
-plotshape(finalSell, title = "Sell", text = 'Sell', style = shape.labeldown, location = location.abovebar, color = color.red,   textcolor = color.white, size = size.tiny)
-
-alertcondition(finalBuy,  "Long Entry",  "UT+Structure Long")
-alertcondition(finalSell, "Short Entry", "UT+Structure Short")
-
-// Permanent historical entry markers - independent of the current trade's
-// SL/TP lines (which get deleted/redrawn each new trade). These persist for
-// every past entry for as long as the indicator has been on the chart.
-longEntryPrice  = finalBuy  ? gEntryPrice : na
-shortEntryPrice = finalSell ? gEntryPrice : na
-plot(showPositionHistory ? longEntryPrice  : na, title = "Long Entry History",  style = plot.style_circles, color = color.new(color.green, 0), linewidth = 3)
-plot(showPositionHistory ? shortEntryPrice : na, title = "Short Entry History", style = plot.style_circles, color = color.new(color.red, 0),   linewidth = 3)
-
-// Hidden plots for alert webhook message tags {{plot(...)}}
-plot(gSlPrice, "SL Level", display = display.none)
-plot(gTp1Price, "TP1 Level", display = display.none)
-plot(gTp2Price, "TP2 Level", display = display.none)
-plot(gTp3Price, "TP3 Level", display = display.none)
-plot(gEntryPrice, "Entry Level", display = display.none)
-
-// ============================================================================
-// BREAKEVEN LOGIC
-// ============================================================================
-beTriggerPrice = beMode == "TP1" ? gTp1Price : beMode == "TP2" ? gTp2Price : beMode == "TP3" ? gTp3Price : na
-beActive       = beMode != "Off" and tradeActive and not beTriggered and not na(beTriggerPrice)
-
-longHitBE    = beActive and tradeIsLong and high >= beTriggerPrice
-shortHitBE   = beActive and not tradeIsLong and low <= beTriggerPrice
-breakevenNow = longHitBE or shortHitBE
-
-if breakevenNow
-    beTriggered := true
-    newSL = tradeIsLong ? gEntryPrice + beOffset : gEntryPrice - beOffset
-    gSlPrice := newSL
-
-    if showSLTP
-        line.set_y1(slLine, newSL)
-        line.set_y2(slLine, newSL)
-        line.set_color(slLine, color.orange)
-        label.set_y(slLabel, newSL)
-        label.set_text(slLabel, "BE (" + str.tostring(newSL, format.mintick) + ")")
-        label.set_color(slLabel, color.orange)
-
-        beLabel := label.new(x = bar_index, y = tradeIsLong ? low : high,
-           text = "BE",
-           style = tradeIsLong ? label.style_label_up : label.style_label_down,
-           color = color.orange, textcolor = color.white,
-           yloc = tradeIsLong ? yloc.belowbar : yloc.abovebar,
-           size = size.tiny)
-
-alertcondition(breakevenNow, "Breakeven", "SL moved to breakeven")
-
-// ============================================================================
-// TRADE OUTCOME TRACKING (feeds the dashboard)
-// ============================================================================
-longHitSL   = tradeActive and tradeIsLong and low <= gSlPrice
-shortHitSL  = tradeActive and not tradeIsLong and high >= gSlPrice
-longHitTP3  = tradeActive and tradeIsLong and high >= gTp3Price
-shortHitTP3 = tradeActive and not tradeIsLong and low <= gTp3Price
-
-if tradeActive and (longHitTP3 or shortHitTP3)
-    r = tradeIsLong ? (gTp3Price - gEntryPrice) / gRisk : (gEntryPrice - gTp3Price) / gRisk
-
-    dayTrades   += 1
-    weekTrades  += 1
-    monthTrades += 1
-    allTrades   += 1
-    dayWins     += 1
-    weekWins    += 1
-    monthWins   += 1
-    allWins     += 1
-    dayR        += r
-    weekR       += r
-    monthR      += r
-    allR        += r
-    tradeActive := false
-
-    if showSLTP
-        label.new(x = bar_index, y = tradeIsLong ? high : low, text = "WIN",
-           style = tradeIsLong ? label.style_label_down : label.style_label_up,
-           color = color.green, textcolor = color.white, size = size.tiny)
-
-else if tradeActive and (longHitSL or shortHitSL)
-    r = tradeIsLong ? (gSlPrice - gEntryPrice) / gRisk : (gEntryPrice - gSlPrice) / gRisk
-
-    dayTrades   += 1
-    weekTrades  += 1
-    monthTrades += 1
-    allTrades   += 1
-    dayR        += r
-    weekR       += r
-    monthR      += r
-    allR        += r
-    tradeActive := false
-
-    outcomeText  = r > 0 ? "WIN" : r < 0 ? "LOSS" : "BE EXIT"
-    outcomeColor = r > 0 ? color.green : r < 0 ? color.red : color.gray
-
-    if r > 0
-        dayWins   += 1
-        weekWins  += 1
-        monthWins += 1
-        allWins   += 1
-    else if r < 0
-        dayLosses   += 1
-        weekLosses  += 1
-        monthLosses += 1
-        allLosses   += 1
-
-    if showSLTP
-        label.new(x = bar_index, y = tradeIsLong ? low : high, text = outcomeText,
-           style = tradeIsLong ? label.style_label_up : label.style_label_down,
-           color = outcomeColor, textcolor = color.white, size = size.tiny)
-
-// ============================================================================
-// DASHBOARD
-// ============================================================================
-dashPos = dashPosition == "Top Left" ? position.top_left :
-   dashPosition == "Top Center" ? position.top_center :
-   dashPosition == "Top Right" ? position.top_right :
-   dashPosition == "Middle Left" ? position.middle_left :
-   dashPosition == "Middle Center" ? position.middle_center :
-   dashPosition == "Middle Right" ? position.middle_right :
-   dashPosition == "Bottom Left" ? position.bottom_left :
-   dashPosition == "Bottom Center" ? position.bottom_center : position.bottom_right
-
-dashSize = dashTextSize == "Tiny" ? size.tiny :
-   dashTextSize == "Small" ? size.small :
-   dashTextSize == "Large" ? size.large : size.normal
-
-var table dash = table.new(position = dashPos, columns = 8, rows = 5, border_width = 1, border_color = color.new(color.gray, 40), frame_color = color.new(color.gray, 40), frame_width = 1)
-
-winPct(wins, trades) =>
-    trades > 0 ? str.tostring(wins / trades * 100, "#.#") + "%" : "-"
-
-rMult(r) =>
-    str.tostring(r, "#.##") + "R"
-
-avgR(r, trades) =>
-    trades > 0 ? str.tostring(r / trades, "#.##") + "R" : "-"
-
-if showDashboard and barstate.islast
-    hdrBg = color.new(color.navy, 0)
-    table.cell(dash, 0, 0, "Period",  bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 1, 0, "Signals", bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 2, 0, "Trades",  bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 3, 0, "Wins",    bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 4, 0, "Losses",  bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 5, 0, "Win %",   bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 6, 0, "Net R",   bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 7, 0, "Avg R",   bgcolor = hdrBg, text_color = color.white, text_size = dashSize)
-
-    rowBg1 = color.new(color.black, 70)
-    rowBg2 = color.new(color.black, 85)
-
-    table.cell(dash, 0, 1, "Today",                    bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 1, 1, str.tostring(daySignals),    bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 2, 1, str.tostring(dayTrades),     bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 3, 1, str.tostring(dayWins),       bgcolor = rowBg1, text_color = color.green, text_size = dashSize)
-    table.cell(dash, 4, 1, str.tostring(dayLosses),     bgcolor = rowBg1, text_color = color.red,   text_size = dashSize)
-    table.cell(dash, 5, 1, winPct(dayWins, dayTrades),  bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 6, 1, rMult(dayR),                 bgcolor = rowBg1, text_color = dayR >= 0 ? color.green : color.red, text_size = dashSize)
-    table.cell(dash, 7, 1, avgR(dayR, dayTrades),       bgcolor = rowBg1, text_color = dayR >= 0 ? color.green : color.red, text_size = dashSize)
-
-    table.cell(dash, 0, 2, "This Week",                    bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 1, 2, str.tostring(weekSignals),      bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 2, 2, str.tostring(weekTrades),       bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 3, 2, str.tostring(weekWins),         bgcolor = rowBg2, text_color = color.green, text_size = dashSize)
-    table.cell(dash, 4, 2, str.tostring(weekLosses),       bgcolor = rowBg2, text_color = color.red,   text_size = dashSize)
-    table.cell(dash, 5, 2, winPct(weekWins, weekTrades),   bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 6, 2, rMult(weekR),                   bgcolor = rowBg2, text_color = weekR >= 0 ? color.green : color.red, text_size = dashSize)
-    table.cell(dash, 7, 2, avgR(weekR, weekTrades),        bgcolor = rowBg2, text_color = weekR >= 0 ? color.green : color.red, text_size = dashSize)
-
-    table.cell(dash, 0, 3, "This Month",                     bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 1, 3, str.tostring(monthSignals),       bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 2, 3, str.tostring(monthTrades),        bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 3, 3, str.tostring(monthWins),          bgcolor = rowBg1, text_color = color.green, text_size = dashSize)
-    table.cell(dash, 4, 3, str.tostring(monthLosses),        bgcolor = rowBg1, text_color = color.red,   text_size = dashSize)
-    table.cell(dash, 5, 3, winPct(monthWins, monthTrades),   bgcolor = rowBg1, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 6, 3, rMult(monthR),                    bgcolor = rowBg1, text_color = monthR >= 0 ? color.green : color.red, text_size = dashSize)
-    table.cell(dash, 7, 3, avgR(monthR, monthTrades),        bgcolor = rowBg1, text_color = monthR >= 0 ? color.green : color.red, text_size = dashSize)
-
-    table.cell(dash, 0, 4, "All-Time",                   bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 1, 4, str.tostring(allSignals),     bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 2, 4, str.tostring(allTrades),      bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 3, 4, str.tostring(allWins),        bgcolor = rowBg2, text_color = color.green, text_size = dashSize)
-    table.cell(dash, 4, 4, str.tostring(allLosses),      bgcolor = rowBg2, text_color = color.red,   text_size = dashSize)
-    table.cell(dash, 5, 4, winPct(allWins, allTrades),   bgcolor = rowBg2, text_color = color.white, text_size = dashSize)
-    table.cell(dash, 6, 4, rMult(allR),                  bgcolor = rowBg2, text_color = allR >= 0 ? color.green : color.red, text_size = dashSize)
-    table.cell(dash, 7, 4, avgR(allR, allTrades),        bgcolor = rowBg2, text_color = allR >= 0 ? color.green : color.red, text_size = dashSize)
+alertcondition(buy_trigger, title="TradePros Buy Signal",
+               message="{\"action\":\"BUY\",\"symbol\":\"{{ticker}}\",\"price\":{{close}},\"time\":\"{{time}}\",\"sl\":{{plot(\"SL Level\")}},\"tp1\":{{plot(\"TP1 Level\")}},\"tp2\":{{plot(\"TP2 Level\")}}}")
+
+alertcondition(sell_trigger, title="TradePros Sell Signal",
+               message="{\"action\":\"SELL\",\"symbol\":\"{{ticker}}\",\"price\":{{close}},\"time\":\"{{time}}\",\"sl\":{{plot(\"SL Level\")}},\"tp1\":{{plot(\"TP1 Level\")}},\"tp2\":{{plot(\"TP2 Level\")}}}")
